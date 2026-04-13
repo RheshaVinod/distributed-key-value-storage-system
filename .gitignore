@@ -1,0 +1,18 @@
+# Java compiled files
+*.class
+*.jar
+*.war
+
+# WAL log (runtime data, not source code)
+wal.log
+
+# VS Code
+.vscode/
+
+# macOS
+.DS_Store
+
+# Build output folders
+out/
+bin/
+build/
