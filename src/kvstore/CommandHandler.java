@@ -3,15 +3,20 @@ package kvstore;
 public class CommandHandler {
     
     private final KVStore store;
-    public CommandHandler(KVStore store){
+    private final ServerRole role;
+    public CommandHandler(KVStore store,ServerRole role){
         this.store=store;
+        this.role=role;
     }
     public String handle(String line) {
         if (line == null || line.isBlank()) return "ERR empty";
         String[] parts = line.trim().split(" ", 3);
         String result;
         String cmd = parts[0].toUpperCase();
-
+        if (role == ServerRole.FOLLOWER &&
+            (cmd.equals("SET") || cmd.equals("DELETE"))) {
+            return "ERR not the leader — connect to port 6379";
+        }
         try {
             switch (cmd) {
                 case "SET":
