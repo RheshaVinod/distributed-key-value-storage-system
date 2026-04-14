@@ -17,3 +17,6 @@ wal-*.log
 out/
 bin/
 build/
+
+# Word documents
+*.docx
