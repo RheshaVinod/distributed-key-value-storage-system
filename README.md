@@ -1,47 +1,76 @@
 # Distributed Key-Value Store
 
-A Redis inspired distributed key-value store built from scratch in Java. Supports concurrent clients, data persistence via a write ahead log, and leader follower replication across multiple nodes.
+A Redis inspired distributed key value store built from scratch in Java no external dependencies. Supports concurrent clients, data persistence via a write ahead log, leader follower replication, and consistent hashing based sharding across multiple nodes.
 
 ---
 
-## Features
+## Performance
 
-- **GET / SET / DELETE** commands over a TCP connection
-- **Concurrent clients** — thread pool handles up to 16 simultaneous connections
-- **Persistence** — write ahead log (WAL) replays data on restart so nothing is lost
-- **Leader-follower replication** — every write to the leader is automatically propagated to all followers
-- **Fault tolerance** — leader continues operating if a follower goes down
-- **Write protection** — followers reject direct writes and redirect clients to the leader
+Benchmarked on localhost with 10,000 operations (single node) and 1,000 operations (sharded via router):
+
+| | Single node | Sharded via router |
+|---|---|---|
+| SET ops/sec | 6,028 | 3,846 |
+| GET ops/sec | 42,918 | 6,993 |
+| SET latency | 0.165ms | 0.256ms |
+| GET latency | 0.023ms | 0.141ms |
+
+Single node
+<img width="756" height="116" alt="image" src="https://github.com/user-attachments/assets/4f96c227-57e6-4579-b815-137702502033" />
+
+Router
+<img width="762" height="118" alt="image" src="https://github.com/user-attachments/assets/f44945e0-42d5-488a-abb3-17c8cf6e639a" />
+
+
+
+GET is ~7x faster than SET on a single node because SET writes to the write ahead log on every operation. The router adds ~2x overhead because each command makes two TCP hops (client→router, router→shard) instead of one.
 
 ---
 
 ## Architecture
 
 ```
-Client
-  │
-  ▼
-KVServer (TCP, port 6379)
-  │
-  ├── CommandHandler   (parses GET / SET / DELETE / REPLICATE)
-  │
-  ├── KVStore          (thread-safe HashMap + ReadWriteLock)
-  │     └── WalWriter  (appends every write to wal-{port}.log)
-  │
-  └── ReplicationClient (fans out writes to followers)
-        └── Follower 1 (port 6380)
-        └── Follower 2 (port 6381)
+         Client
+           │
+           ▼
+      Router :8000
+    (consistent hash ring)
+      ↙            ↘
+Leader :6379     Leader :6381
+  (Shard 1)        (Shard 2)
+     │                 │
+     ▼                 ▼
+Follower :6380    Follower :6382
+     │                 │
+     ▼                 ▼
+wal-6379.log      wal-6381.log
 ```
 
 ### Key design decisions
 
-**Write-ahead log (WAL)** — every SET and DELETE is written to disk before the HashMap is updated. On restart the server replays the log line by line to restore state. Flushing on every write is intentionally safe over fast  a production improvement would be batched WAL flushes.
+**Write-ahead log (WAL)** — every SET and DELETE is written to disk before the HashMap is updated. On restart the server replays the log to restore state. Flushing on every write is intentionally safe over fast  a production improvement would be batched WAL flushes with configurable durability guarantees.
 
-**ReadWriteLock** — multiple threads can read the HashMap simultaneously since reads don't change state. Writes acquire an exclusive lock, blocking all readers. This is more efficient than a single `synchronized` block for read heavy workloads.
+**Synchronized methods** — every KVStore method is `synchronized` so multiple threads cannot corrupt the HashMap. A `ReadWriteLock` would allow concurrent reads for higher throughput on read-heavy workloads  noted as a future improvement.
 
-**Replication model** — the leader opens a fresh TCP connection to each follower on every write and sends a `REPLICATE SET/DELETE` command. Followers apply it directly to their HashMap via `applyCommand()` without rewriting to their own WAL or triggering further replication, preventing infinite loops.
+**Replication model** — the leader opens a TCP connection to each follower on every write and sends a `REPLICATE` command. Followers call `applyCommand()` directly  no WAL write, no further replication  preventing infinite loops.
 
-**Follower reads** — followers serve GET requests directly. This offloads read traffic from the leader at the cost of potential stale reads if replication lags.
+**Consistent hashing** — the router uses a hash ring with virtual nodes to map keys to shards. When a shard is added or removed, only the keys in the affected range need to move. A regular `key % numShards` approach would reassign almost all keys on any topology change.
+
+**Follower reads** — followers serve GET requests directly, offloading read traffic from leaders at the cost of potential stale reads if replication lags.
+
+---
+
+## Features
+
+- GET / SET / DELETE commands over TCP
+- PING / PONG health check
+- Concurrent clients — thread pool handles multiple simultaneous connections
+- Persistence — WAL replays data on restart
+- Leader-follower replication — writes propagate to followers automatically
+- Fault tolerance — leader keeps running if a follower goes down
+- Write protection — followers reject direct writes
+- Sharding — consistent hash ring distributes keys across multiple leader nodes
+- Router — single entry point, clients never need to know about sharding
 
 ---
 
@@ -50,7 +79,7 @@ KVServer (TCP, port 6379)
 ### Prerequisites
 
 - Java 11 or higher
-- A terminal that supports multiple tabs (VS Code terminal, iTerm2, etc.)
+- Multiple terminal tabs (VS Code terminal, iTerm2)
 
 ### Build
 
@@ -59,28 +88,25 @@ mkdir -p out
 javac -d out src/kvstore/*.java
 ```
 
-### Run
+### Run the full cluster
 
-**Terminal 1 — start the leader:**
 ```bash
-java -cp out kvstore.Main leader 6379
-```
-
-**Terminal 2 — start a follower:**
-```bash
+# Shard 1
+java -cp out kvstore.Main leader   6379
 java -cp out kvstore.Main follower 6380
+
+# Shard 2
+java -cp out kvstore.Main leader   6381
+java -cp out kvstore.Main follower 6382
+
+# Router
+java -cp out kvstore.Main router   8000
 ```
 
-### Connect and use
+### Connect
 
-**Terminal 3 — connect to the leader:**
 ```bash
-nc localhost 6379
-```
-
-**Terminal 4 — connect to the follower:**
-```bash
-nc localhost 6380
+nc localhost 8000
 ```
 
 ### Commands
@@ -94,38 +120,43 @@ nc localhost 6380
 
 ---
 
-## Replication demo
+## Demo
 
-```
-# Write to leader (Terminal 3)
-SET name Alice    → OK
-SET city London   → OK
+```bash
+# Connect to router
+nc localhost 8000
 
-# Read from follower (Terminal 4)
-GET name          → Alice
-GET city          → London
+SET name Alice      # → OK  (routed to correct shard automatically)
+SET city London     # → OK  (may go to a different shard)
+GET name            # → Alice
+GET city            # → London
 
-# Try writing to follower
-SET name Bob      → ERR not the leader — connect to port 6379
+# Try writing directly to a follower
+nc localhost 6380
+SET name Bob        # → ERR not the leader — connect to port 6379
+
+# Verify replication — read from follower
+nc localhost 6380
+GET name            # → Alice  (replicated from leader)
+
+# Restart the leader — data survives
+# Ctrl+C on leader terminal, then:
+java -cp out kvstore.Main leader 6379
+# Output: Replaying WAL... WAL replay complete.
+nc localhost 6379
+GET name            # → Alice  (restored from WAL)
 ```
 
 ---
 
-## Persistence demo
+## Benchmark
 
-```
-# Write some data
-SET name Alice    → OK
+```bash
+# Single node
+java -cp out kvstore.Benchmark localhost 6379 10000
 
-# Stop the server (Ctrl+C) and restart it
-java -cp out kvstore.Main leader 6379
-
-# Output on restart:
-# Replaying WAL...
-# WAL replay complete.
-
-# Data is still there
-GET name          → Alice
+# Sharded via router
+java -cp out kvstore.Benchmark localhost 8000 1000
 ```
 
 ---
@@ -134,37 +165,40 @@ GET name          → Alice
 
 ```
 src/kvstore/
-├── Main.java               entry point, TCP server, thread pool
+├── Main.java               entry point- leader, follower, or router mode
 ├── KVStore.java            thread-safe HashMap with WAL integration
 ├── CommandHandler.java     parses and routes client commands
-├── WalWriter.java          write ahead log  append and replay
+├── WalWriter.java          write ahead log append and replay on boot
 ├── ReplicationClient.java  fans writes out to follower nodes
-└── ServerRole.java         LEADER / FOLLOWER enum
+├── ServerRole.java         LEADER / FOLLOWER enum
+├── HashRing.java           consistent hash ring with virtual nodes
+├── Router.java             single entry point, forwards commands to shards
+└── Benchmark.java          load testing  measures ops/sec and latency
 ```
 
 ---
 
 ## Tradeoffs and future improvements
 
-| Area | Current approach | Production improvement |
+| Area | Current | Production improvement |
 |---|---|---|
-| WAL flush | Flush on every write (safe, slow) | Batch flushes every N ms |
-| Replication | New TCP connection per write | Persistent connection with heartbeat |
-| Consistency | Eventual (async replication) | Synchronous replication with quorum |
-| Leader election | Manual (set via CLI arg) | Raft consensus algorithm |
-| Sharding | Single leader holds all keys | Consistent hashing across multiple leaders |
+| WAL flush | Per write (safe, slow) | Batched flushes, configurable durability |
+| Locking | synchronized (simple) | ReadWriteLock for concurrent reads |
+| Replication | New TCP connection per write | Persistent connection per follower |
+| Consistency | Eventual (async) | Synchronous with quorum acknowledgement |
+| Leader election | Manual CLI flag | Raft consensus algorithm |
+| Router | Single point of failure | Replicated router with failover |
 | Monitoring | Console logs | Prometheus metrics + Grafana dashboard |
 
 ---
 
 ## What I learned
 
-Building this from scratch gave me direct experience with the core problems in distributed systems:
-
-- **Race conditions** — why every shared data structure needs a lock and what happens when you forget one
-- **Fault tolerance** — designing systems that degrade gracefully rather than crash entirely  
-- **The WAL pattern** — why write order matters and how databases recover from crashes
-- **CAP theorem in practice** — this system prioritises availability over strong consistency. A follower may briefly serve stale data after a write, which is an explicit tradeoff for higher read throughput
+- **Race conditions** — why every shared data structure needs a lock and what breaks without one
+- **WAL pattern** — why write order to disk matters and how databases recover from crashes
+- **Consistent hashing** — why `key % n` breaks on topology changes and how a hash ring fixes it
+- **CAP theorem in practice** — this system prioritises availability over strong consistency; followers may briefly serve stale reads after a write, which is an explicit tradeoff for higher read throughput
+- **Distributed fault tolerance** — designing components that degrade gracefully rather than taking down the whole system
 
 ---
 
