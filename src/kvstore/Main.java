@@ -6,6 +6,8 @@ import java.io.InputStreamReader;
 import java.io.PrintWriter;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.util.Arrays;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -39,12 +41,18 @@ public class Main {
 
     int port = Integer.parseInt(args[1]);
     String walFile = "wal-" + port + ".log";
+    ReplicationClient replication = null;
+    if (role == ServerRole.LEADER) {
+        List<String> followers = Arrays.asList("localhost:6380");
+        replication = new ReplicationClient(followers);
+        System.out.println("Replicating to: " + followers);
+    }
 
 
         WalWriter wal = new WalWriter(walFile);;
-        KVStore store = new KVStore(wal);
+        KVStore store = new KVStore(wal,replication);
         WalWriter.replay(walFile, store); 
-        ExecutorService pool = Executors.newFixedThreadPool(16);
+        ExecutorService pool = Executors.newFixedThreadPool(32);
         try (ServerSocket server = new ServerSocket(port)){
         System.out.println("[" + role + "] Listening on port " + port);
         while (true){

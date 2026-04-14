@@ -29,6 +29,11 @@ public class CommandHandler {
                 case "DELETE":
                     result = store.delete(parts[1]) ? "OK" : "(not found)";
                     break;
+                case "REPLICATE":
+                    String inner = line.trim().substring("REPLICATE ".length());
+                    store.applyCommand(inner);
+                    result = "OK";
+                    break;
                 case "PING":
                     result = "PONG";
                     break;
